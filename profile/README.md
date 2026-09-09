@@ -45,10 +45,8 @@
 │  0.flow — IDE shell (Code OSS fork, Electron)        │
 │    └─ flow-ext — VS Code extension (TypeScript)      │  ← UI: чат, tools, steering
 │    └─ flow-cli — Rust backend (binary)               │  ← ядро: LLM, tools, MCP
+│         └─ читает роль и контекст сессии из 0.agent  │  ← контекст агента
 └──────────────────────────────────────────────────────┘
-        │  методология (0.agent) — роли, сессии, правила
-        ▼
-    инженер работает в привычном редакторе
 ```
 
 | Компонент | Роль | Технология |
@@ -79,9 +77,9 @@ graph TB
         storage["flow-storage<br/>SQLite"]
     end
 
-    subgraph meta["0.agent — мета-слой"]
-        roles["роли · компетенции · навыки"]
-        sessions["сессии · правила · контекст"]
+    subgraph meta["0.agent — роль и контекст сессии"]
+        role["роль · компетенции · навыки"]
+        ctx["контекст сессии (L1/L2/L3)"]
     end
 
     user --> shell
@@ -93,8 +91,7 @@ graph TB
     server --> actor
     server --> intent
     server --> storage
-    meta -. задаёт правила .-> ext
-    meta -. задаёт правила .-> session
+    meta -. встраивается в роль агента .-> session
 ```
 
 ## flow-cli — Rust backend
