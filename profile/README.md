@@ -2,142 +2,181 @@
 
 # 0.flow
 
-**Stateful IDE with Local Intelligence**
+**Stateful AI IDE — агентская разработка в редакторе**
 
-*The AI coding assistant that remembers your project, understands your intent, and routes decisions before the LLM even sees your prompt.*
-
-[Architecture](#architecture) · [How It Works](#how-it-works) · [Comparison](#comparison) · [Status](#status)
+*AI-ассистент, который помнит ваш проект, классифицирует намерение и маршрутизирует запросы до дорогого LLM. Бэкенд — Rust, UI — VS Code extension, методология — отдельный слой.*
 
 </div>
 
 ---
 
-## The Problem
+## Проблема
 
-Every AI coding tool today is **stateless**. You open a chat, explain context, get help, close the chat — and everything is lost. Next time you start from scratch.
+Многие AI-инструменты для кода хорошо отвечают на точечный запрос, но слабо держат контекст проекта между сессиями: его приходится объяснять заново, а структура проекта используется непоследовательно. Те, кто решает это «умным» поиском по всему коду, часто платят сложностью и стоимостью: RAG-слой с чанкингом и эмбеддингами, недетерминированный выбор кусков контекста, пересборка контекста от запроса к запросу.
 
-- No memory between sessions
-- No understanding of your project structure
-- No role specialization
-- Same expensive model for "hello" and "refactor the auth module"
-- Full system prompt loaded for every request regardless of intent
+Мы подошли иначе: не внешний поисковый слой поверх контекста, а знание, уже размеченное для загрузки (тема, триггер, уровень). Зачем это — в разделе ниже.
 
-## The Solution
+## Решение: структура = ретривал, а не RAG
 
-**0.flow** combines two layers that no other tool has:
+0.flow не строит RAG-слой как заплатку от раздувания контекста. Знание в системе уже **семантически разбито для поиска**: у каждой единицы знания есть тема, триггер и уровень загрузки. Ретривал **вшит в структуру**, а не висит отдельным эмбеддинговым слоем поверх.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Layer 1: Local Intent (0ms, per-request)           │
-│  ─────────────────────────────────────────────────  │
-│  • Classifies intent BEFORE sending to LLM          │
-│  • Routes to optimal model (cost-aware)             │
-│  • Selects context level (200 / 700 / 2000 tokens)  │
-│  • Picks tools, role, reasoning mode                │
-│  • Keyword: 0ms | Local LLM: 300ms | API: 500ms     │
-└─────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────┐
-│  Layer 2: Persistent Memory (cross-session)         │
-│  ─────────────────────────────────────────────────  │
-│  • Sessions with structured context (L1/L2/L3)      │
-│  • Roles & competencies (22 roles, 6-7 each)        │
-│  • Decision history (append-only log)               │
-│  • Orchestrators, child sessions, cross-project     │
-│  • Semantic search across all history (5ms)         │
-└─────────────────────────────────────────────────────┘
+знание → структура (индексы, spec_refs, навыки с topics, L1/L2/L3)
+   │  модель грузит ровно то, что нужно, по явной теме
+   ▼
+стабильный префикс → переиспользование KV-кэша
 ```
 
-**Analogy**: Layer 1 is the cerebellum (instant reflexes). Layer 2 is long-term memory. Together — an agent that grows with your project.
+**Зачем это**: детерминизм. Структурный ретривал даёт стабильный контекст, а стабильный контекст даёт стабильный префикс — модель переиспользует KV-кэш, вместо того чтобы каждый раз пересчитывать всё. RAG, наоборот, вносит недетерминизм и ломает кэш.
 
-## How It Works
+**Честно про эмбеддинги**: они есть (ONNX), но используются не как первичный ретривал знания, а точечно, где фаззи-поиск реально нужен — поиск по коду и роутинг. Знание загружается структурно.
+
+| Слой | Метод | Почему |
+|------|-------|--------|
+| знание (роли, спеки, навыки) | структурный ретривал | детерминизм + кэш |
+| код, роутинг | эмбеддинги (ONNX) | фаззи-поиск, где нужен |
+
+Экономия тут не «сделали бесплатно», а **«не строили то, что не нужно»**: без чанкинга, без отдельного ретривал-слоя, без налога на инфраструктуру. Это zero-cost подход к контексту: одна LLM, никакого дообучения и внешнего RAG.
+
+А вокруг — экосистема из четырёх компонентов, работающих как одно целое:
 
 ```
-User: "continue what we did yesterday"
-
-  Intent (0ms): action=session_mgmt, target=last_session
-  → DON'T send to LLM
-  → Find last session (from memory)
-  → Load context (500 tokens)
-  → Show status
-  → Next prompt already has yesterday's context
-
-User: "ok, finish the tests"
-
-  Intent (0ms): action=code, model=heavy, context=L2
-  → System prompt: role=coder + dev workflow + session context
-  → Model: DeepSeek Pro (reasoning=off, code task)
-  → Tools: [readFile, writeFile, shell, grep]
-  → Agent knows WHAT to test (from session context)
+┌──────────────────────────────────────────────────────┐
+│  0.flow — IDE shell (Code OSS fork, Electron)        │
+│    └─ flow-ext — VS Code extension (TypeScript)      │  ← UI: чат, tools, steering
+│    └─ flow-cli — Rust backend (binary)               │  ← ядро: LLM, tools, MCP
+└──────────────────────────────────────────────────────┘
+        │  методология (0.agent) — роли, сессии, правила
+        ▼
+    инженер работает в привычном редакторе
 ```
 
-No manual context loading. No "let me explain the project again". The IDE already knows.
+| Компонент | Роль | Технология |
+|-----------|------|-----------|
+| **0.flow** | IDE shell (контейнер) | Code OSS fork, Electron, patches |
+| **flow-ext** | VS Code extension — UI-слой | TypeScript, SolidJS, Bun, HTTP/SSE |
+| **flow-cli** | Rust backend — ядро | Rust, axum, tokio, SSE |
+| **0.agent** | мета-слой / центр методологии | роли, сессии, правила, компетенции |
 
-## Architecture
+Конечный пользователь работает в 0.flow (или любом VS Code с flow-ext). Под капотом: extension (flow-ext) → Rust backend (flow-cli), а поверх — мета-слой 0.agent, который задаёт правила работы агентов.
 
 ```mermaid
 graph TB
-    subgraph "Per-Request (0ms)"
-        A[User Prompt] --> B[Intent Classifier]
-        B --> C{Keyword Match?}
-        C -->|Yes, 70%| D[Route Decision]
-        C -->|No| E[Local LLM / API]
-        E --> D
-        D --> F[Model Selection]
-        D --> G[Context Level]
-        D --> H[Tool Selection]
-        D --> I[Role + Competencies]
+    user["👤 Developer"]
+
+    subgraph shell["0.flow — IDE shell (Code OSS fork)"]
+        ext["flow-ext — VS Code extension<br/>chat UI · settings · steering"]
     end
 
-    subgraph "Persistent Memory"
-        J[(Session Index)] --> B
-        K[(Project Registry)] --> D
-        L[(Roles & Competencies)] --> I
-        M[(Context Levels)] --> G
+    subgraph backend["flow-cli — Rust backend"]
+        server["flow-server (axum)<br/>HTTP + SSE"]
+        session["flow-session<br/>LLM ↔ tools цикл"]
+        llm["flow-llm<br/>5 провайдеров"]
+        tool["flow-tool<br/>17 tools + MCP proxy"]
+        perm["flow-permission<br/>gating"]
+        actor["flow-agent / акторный слой<br/>(ADR-16/23, ядро live)"]
+        intent["flow-intent<br/>routing"]
+        storage["flow-storage<br/>SQLite"]
     end
 
-    F --> N[LLM Request]
-    G --> N
-    H --> N
-    I --> N
-    N --> O[Response]
+    subgraph meta["0.agent — мета-слой"]
+        roles["роли · компетенции · навыки"]
+        sessions["сессии · правила · контекст"]
+    end
+
+    user --> shell
+    ext --HTTP/SSE--> server
+    server --> session
+    session --> llm
+    session --> tool
+    tool --> perm
+    server --> actor
+    server --> intent
+    server --> storage
+    meta -. задаёт правила .-> ext
+    meta -. задаёт правила .-> session
 ```
 
-## Comparison
+## flow-cli — Rust backend
 
-| | Cursor | Kiro | Copilot | **0.flow** |
-|---|:---:|:---:|:---:|:---:|
-| Cross-session memory | ❌ | ❌ | ❌ | ✅ |
-| Roles & competencies | ❌ | ❌ | ❌ | ✅ |
-| Dynamic system prompt | ❌ | partial | ❌ | ✅ |
-| Local intent (0ms) | ❌ | ❌ | ❌ | ✅ |
-| Auto model routing | ❌ | ❌ | ❌ | ✅ |
-| Context level routing | ❌ | ❌ | ❌ | ✅ |
-| Session orchestration | ❌ | ❌ | ❌ | ✅ |
-| Semantic session search | ❌ | ❌ | ❌ | ✅ |
-| Cost-aware decisions | ❌ | ❌ | ❌ | ✅ |
-| Offline capable | ❌ | ❌ | ❌ | ✅ |
+Замена kilo.exe (Bun/TypeScript, ~140 MB) на компактный Rust binary.
 
-## Stack
+Единый binary, несколько transport-режимов:
+- `serve` — HTTP/SSE (для extension)
+- `chat` — TUI (терминальный агент)
+- `pipe` — stdin/stdout JSON (CI/CD, headless)
+- `acp` — JSON-RPC (JetBrains, Zed)
+
+Внутри — 16 crates, слоями:
+
+```
+TRANSPORT:      flow-server (axum) · flow-cli-lib (TUI/pipe)
+ORCHESTRATION:  flow-session (LLM↔tools) · flow-agent (registry/routing)
+CAPABILITIES:   flow-llm (5 провайдеров) · flow-tool (17 tools + MCP proxy)
+                flow-mcp · flow-pty
+SERVICES:       flow-bus · flow-storage (SQLite) · flow-permission
+                flow-config · flow-vault (AES-256-GCM) · flow-search (ONNX) · flow-intent
+FOUNDATION:     flow-core (types, traits, errors)
+```
+
+Ключевое: **LLM streaming (SSE), 5 провайдеров, 17 tools + MCP-прокси, permission-gated исполнение, intent-классификатор для маршрутизации модели**.
+
+## flow-ext — VS Code extension
+
+Чистый VS Code extension (без наследия Kilo Code / Effect.ts / Kilo SDK). UI-слой над flow-cli:
+- Chat UI (SolidJS webview) — разговор с LLM через flow-cli
+- Settings — провайдеры, модели, steering
+- Terminal — PTY bridge через flow-cli
+- Session management — история, поиск, навигация
+- Cost tracking — учёт использования
+
+## Метрики (актуальные, продукт)
+
+| Домен | Показатель | Источник |
+|-------|-----------|----------|
+| **flow-cli Radar** | **8.49/10** (32 компонента, 0🔴, 109🟢) | radar INDEX v57, 2026-09-05 |
+| **flow-cli тесты** | ~1157 (unit ~1061 + int 68 + proptest 28) | radar v57 (Test Infrastructure) |
+| **Акторный слой (live)** | 33/33 PASS, 0 SIDE_BUG | live-валидация R146-R148 |
+| **flow-ext Radar** | ~8.70 mean (41 активных, 🔴 0) | flow-ext-radar v6, R131 refresh |
+| **flow-ext top** | Connection 9.40 · SSE 9.30 · Preloader 9.25 | flow-ext-radar v6 |
+
+## 0.agent — мета-слой / центр методологии
+
+0.agent — это не рантайм, а **центр**: правила, роли, сессии, компетенции, по которым работают агенты. Методологический слой, который задаёт дисциплину поверх любого движка.
+
+## Направление: акторная модель (ADR-16/23, ядро live)
+
+Координация агентов — это направление развития, и его **ядро доведено до работающего live-состояния** в flow-cli (Actor Runtime radar 9.0/10):
+- Акторы создаются из **образов** (двухуровневый core+state) + портабельный дамп save/load_image.
+- Акторы **живут**: Lifecycle FSM, promote/wake, spawn.
+- Акторы **общаются** через Inbox (REST) + slash-команды.
+- Live-валидация: **33/33 PASS, 0 SIDE_BUG**.
+
+Это реализовано как часть движка (flow-cli) и live-валидировано; как готовый пользовательский продукт/рантайм поверх IDE — ещё направление.
+
+## Чем это отличается
+
+- **Не «использую фреймворк», а спроектировано как исследование.** Акторная модель — авторская, harness собран с оглядкой на существующие подходы (в т.ч. Kiro.dev как референс), но как собственная архитектура, не форк.
+- **Rust-ядро + чистый TS-extension**, без вендор-лока и наследия.
+- **Методология отделена от движка** (0.agent) — работает поверх любого бэкенда.
+
+## Стек
 
 - **IDE Shell**: Code OSS fork (Electron, patches over 1.107.1)
-- **Extension**: TypeScript, SolidJS, Effect-TS, Bun
-- **Intent Classifier**: Keyword (0ms) + Qwen3-0.6B GGUF (local) + API fallback
-- **Embeddings**: MiniLM-L6-v2 (ONNX, 384 dims, in-process worker)
-- **Vector Store**: LanceDB (embedded)
-- **Models**: BYOK — DeepSeek, MiniMax, Claude, Qwen, local Ollama
+- **Extension (flow-ext)**: TypeScript, SolidJS, Bun
+- **Backend (flow-cli)**: Rust, axum, tokio, rusqlite, rmcp, ring
+- **Мета-слой (0.agent)**: роли/компетенции/навыки, сессии, правила
+- **AI**: BYOK (5 облачных: Anthropic, OpenAI, Gemini, Azure, Bedrock) + локальный Ollama
 
-## Status
+## Статус
 
-| Component | Status |
+| Компонент | Статус |
 |-----------|--------|
-| IDE (Code OSS fork) | ✅ Working (Windows x64) |
-| Extension (chat, tools, steering) | ✅ Working |
-| Intent Classifier (multi-provider) | ✅ Working |
-| Semantic Search (@codebase) | ✅ Working |
-| Session Memory (0.agent) | ✅ Working (174+ sessions) |
-| Model Routing (Auto mode) | ✅ Working |
+| 0.flow (IDE shell) | ✅ Working (Windows x64) |
+| flow-cli (Rust backend) | ✅ Working |
+| flow-ext (extension) | ✅ Working |
+| 0.agent (мета-слой) | ✅ Working |
+| Акторная модель (ADR-16/23) | ✅ Ядро live · продукт-рантайм — направление |
 | Linux / macOS | 📋 Planned |
 | Public release | 📋 Planned |
 
@@ -145,78 +184,6 @@ graph TB
 
 <div align="center">
 
-**Built with 0.flow** — this IDE develops itself.
+**Built with 0.flow**
 
 </div>
-
----
-
-<details>
-<summary>🇷🇺 Русская версия</summary>
-
-## 0.flow — Stateful IDE с локальным интеллектом
-
-**AI-ассистент для разработки, который помнит ваш проект, понимает намерение и принимает решения ДО обращения к LLM.**
-
-### Проблема
-
-Все AI-инструменты для кода сегодня — stateless. Открыл чат, объяснил контекст, получил помощь, закрыл — всё потеряно. В следующий раз начинаешь с нуля.
-
-### Решение
-
-Два слоя которых нет ни у кого:
-
-**Слой 1 — Локальный Intent (0ms, per-request):**
-- Классифицирует намерение ДО отправки в LLM
-- Выбирает оптимальную модель (с учётом стоимости)
-- Определяет уровень контекста (200 / 700 / 2000 токенов)
-- Подбирает tools, роль, режим reasoning
-
-**Слой 2 — Долговременная память (cross-session):**
-- Сессии со структурированным контекстом (L1/L2/L3)
-- Роли и компетенции (22 роли, 6-7 компетенций каждая)
-- История решений (append-only лог)
-- Оркестраторы, дочерние сессии, cross-project
-- Семантический поиск по всей истории (5ms)
-
-**Аналогия**: Слой 1 = мозжечок (мгновенные рефлексы). Слой 2 = долговременная память. Вместе = агент который растёт вместе с проектом.
-
-### Пример
-
-```
-Пользователь: "продолжи то что вчера делали"
-
-  Intent (0ms): action=session_mgmt, target=last_session
-  → НЕ отправлять в LLM
-  → Найти последнюю сессию
-  → Загрузить контекст (500 токенов)
-  → Следующий промт уже с контекстом вчерашней работы
-
-Пользователь: "ок, допиши тесты"
-
-  Intent (0ms): action=code, model=heavy, context=L2
-  → System prompt: role=coder + DEV_WORKFLOW + контекст сессии
-  → Model: DeepSeek Pro
-  → Агент знает ЧТО тестировать (из контекста сессии)
-```
-
-### Сравнение
-
-| | Cursor | Kiro | Copilot | **0.flow** |
-|---|:---:|:---:|:---:|:---:|
-| Память между сессиями | ❌ | ❌ | ❌ | ✅ |
-| Роли и компетенции | ❌ | ❌ | ❌ | ✅ |
-| Динамический system prompt | ❌ | частично | ❌ | ✅ |
-| Локальный intent (0ms) | ❌ | ❌ | ❌ | ✅ |
-| Auto model routing | ❌ | ❌ | ❌ | ✅ |
-| Оркестрация сессий | ❌ | ❌ | ❌ | ✅ |
-| Семантический поиск | ❌ | ❌ | ❌ | ✅ |
-| Работа offline | ❌ | ❌ | ❌ | ✅ |
-
-### Статус
-
-Рабочий прототип. Windows x64. 174+ сессий в production (self-hosted development).
-
-**Собран с помощью 0.flow** — эта IDE разрабатывает сама себя.
-
-</details>
